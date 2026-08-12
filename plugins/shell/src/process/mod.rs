@@ -369,8 +369,8 @@ impl Command {
 
             #[cfg(windows)]
             {
-                cmd_wrap.wrap(process_wrap::std::CreationFlags(CREATE_NO_WINDOW));
                 cmd_wrap.wrap(process_wrap::std::JobObject);
+                cmd_wrap.wrap(RestoreCreationFlags);
             }
         }
 
@@ -532,6 +532,33 @@ fn spawn_pipe_reader<F: Fn(Vec<u8>) -> CommandEvent + Send + Copy + 'static>(
             read_line(reader, tx, wrapper);
         }
     });
+}
+
+/// Reapplies our creation flags after `JobObject` overwrites them.
+///
+/// process-wrap's own `CreationFlags` wrapper is meant to coordinate with
+/// `JobObject`, but `get_wrap` sees an empty wrapper map during spawn
+/// (watchexec/process-wrap#35), so `JobObject::pre_spawn` replaces the flags
+/// with just CREATE_SUSPENDED, dropping CREATE_NO_WINDOW and flashing a
+/// console window. Registered *after* `JobObject` this hook runs last,
+/// restoring CREATE_NO_WINDOW while keeping CREATE_SUSPENDED — the child
+/// must stay suspended until it is assigned to the job, and
+/// `JobObject::wrap_child` still resumes it afterwards.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct RestoreCreationFlags;
+
+#[cfg(windows)]
+impl process_wrap::std::StdCommandWrapper for RestoreCreationFlags {
+    fn pre_spawn(
+        &mut self,
+        command: &mut StdCommand,
+        _core: &process_wrap::std::StdCommandWrap,
+    ) -> std::io::Result<()> {
+        use windows::Win32::System::Threading::CREATE_SUSPENDED;
+        command.creation_flags((CREATE_SUSPENDED | CREATE_NO_WINDOW).0);
+        Ok(())
+    }
 }
 
 /// Waits for the child to exit, returning its final exit status.
@@ -1128,6 +1155,23 @@ mod tests {
             watchdog("output-echo");
             let output = tauri::async_runtime::block_on(
                 Command::new("cmd").args(["/C", "echo hello"]).output(),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
+        }
+
+        /// The job-object path spawns CREATE_SUSPENDED and resumes after
+        /// assignment; if the resume ever breaks, the child stays suspended
+        /// and this trips the watchdog instead of completing.
+        #[test]
+        fn diag_output_echo_job() {
+            watchdog("output-echo-job");
+            let output = tauri::async_runtime::block_on(
+                Command::new("cmd")
+                    .args(["/C", "echo hello"])
+                    .set_process_group(true)
+                    .output(),
             )
             .unwrap();
             assert!(output.status.success());
