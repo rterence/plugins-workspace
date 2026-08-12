@@ -22,3 +22,16 @@ jobs:
         env:
           RUST_LOG: process_wrap=trace
         run: cargo run --release
+
+  plugin-tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run shell plugin tests
+        run: cargo test --package tauri-plugin-shell --lib -- --test-threads=1 --nocapture

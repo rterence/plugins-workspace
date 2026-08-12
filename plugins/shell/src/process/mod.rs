@@ -937,4 +937,126 @@ mod tests {
             "grandchild should be killed when process_group is on"
         );
     }
+
+    /// Windows diagnostics for the kill() hang reported on PR #3351.
+    ///
+    /// These drive the real `spawn()`/`kill()` (os_pipe plumbing, reader
+    /// guard, bounded event channel, tauri async runtime) — everything the
+    /// example app uses short of the webview IPC layer. Each test prints
+    /// stage markers and arms a watchdog so a hang identifies its stage in
+    /// CI logs instead of timing out silently.
+    #[cfg(windows)]
+    mod win_diag {
+        use super::super::*;
+        use std::time::Duration;
+
+        fn watchdog(name: &'static str) {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                println!("WATCHDOG: {name} HUNG");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                std::process::exit(101);
+            });
+        }
+
+        fn mark(name: &str, stage: &str) {
+            println!("[{name}] {stage}");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+
+        /// Drain events until Terminated or timeout; panics on timeout.
+        fn expect_terminated(name: &'static str, mut rx: Receiver<CommandEvent>) {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    while let Some(event) = rx.recv().await {
+                        if let CommandEvent::Terminated(payload) = event {
+                            let _ = done_tx.send(payload);
+                            return;
+                        }
+                    }
+                });
+            });
+            match done_rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(payload) => mark(name, &format!("terminated: {payload:?}")),
+                Err(e) => panic!("[{name}] no Terminated event within 20s: {e}"),
+            }
+        }
+
+        fn long_running() -> Command {
+            Command::new("ping").args(["-n", "90", "127.0.0.1"])
+        }
+
+        fn tree_running() -> Command {
+            Command::new("cmd").args([
+                "/C",
+                "start /B ping -n 90 127.0.0.1 > NUL & ping -n 90 127.0.0.1 > NUL",
+            ])
+        }
+
+        fn kill_scenario(name: &'static str, cmd: Command, expect_event: bool) {
+            watchdog(name);
+            mark(name, "spawning");
+            let (rx, child) = cmd.spawn().unwrap();
+            mark(name, &format!("spawned pid {}", child.pid()));
+            std::thread::sleep(Duration::from_millis(500));
+            mark(name, "killing");
+            child.kill().unwrap();
+            mark(name, "killed");
+            if expect_event {
+                expect_terminated(name, rx);
+            }
+        }
+
+        #[test]
+        fn diag_kill_plain_live() {
+            kill_scenario("plain-live", long_running(), true);
+        }
+
+        #[test]
+        fn diag_kill_job_live() {
+            kill_scenario("job-live", long_running().set_process_group(true), true);
+        }
+
+        #[test]
+        fn diag_kill_job_tree() {
+            kill_scenario("job-tree", tree_running().set_process_group(true), true);
+        }
+
+        /// Without a process group the `start /B` grandchild survives the
+        /// kill and keeps the stdio pipes open, so Terminated is expected to
+        /// lag — only assert that kill() itself returns.
+        #[test]
+        fn diag_kill_plain_tree_kill_returns() {
+            kill_scenario("plain-tree", tree_running(), false);
+        }
+
+        #[test]
+        fn diag_kill_job_after_exit() {
+            watchdog("job-after-exit");
+            let cmd = Command::new("cmd")
+                .args(["/C", "echo done"])
+                .set_process_group(true);
+            mark("job-after-exit", "spawning");
+            let (rx, child) = cmd.spawn().unwrap();
+            mark("job-after-exit", &format!("spawned pid {}", child.pid()));
+            std::thread::sleep(Duration::from_secs(2));
+            mark("job-after-exit", "killing exited child");
+            // Child exited long ago; kill() must not hang on the stale job.
+            let _ = child.kill();
+            mark("job-after-exit", "killed");
+            expect_terminated("job-after-exit", rx);
+        }
+
+        #[test]
+        fn diag_output_echo() {
+            watchdog("output-echo");
+            let output = tauri::async_runtime::block_on(
+                Command::new("cmd").args(["/C", "echo hello"]).output(),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
+        }
+    }
 }
