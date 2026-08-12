@@ -77,11 +77,23 @@ impl CommandChild {
 
     /// Sends a kill signal to the child, then waits for it to exit.
     /// When the child was spawned with `process_group` enabled, this kills the
-    /// entire process group (POSIX) or job object (Windows), reaping every
-    /// member before returning.
+    /// entire process group (POSIX) or job object (Windows).
     pub fn kill(self) -> crate::Result<()> {
-        self.inner.lock().unwrap().kill()?;
-        Ok(())
+        self.inner.lock().unwrap().start_kill()?;
+        // `StdChildWrapper::wait` can block with the lock held (the Windows
+        // job-object wait parks in GetQueuedCompletionStatus), which would
+        // hang every other user of the child. Instead block on the raw
+        // process outside the lock — `self` keeps the underlying handle
+        // alive, so the pid cannot be recycled — then let the wrapper reap
+        // under the lock. The wait thread may win that race; both sides
+        // tolerate the other having reaped first.
+        ExitWaiter::new(self.pid)?.wait()?;
+        loop {
+            if self.inner.lock().unwrap().try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Returns the process pid.
@@ -364,10 +376,12 @@ impl Command {
 
         let wrapped_child = cmd_wrap.spawn()?;
         let pid = wrapped_child.id();
+        // Constructed while the child is definitely alive; see `ExitWaiter`.
+        let waiter = ExitWaiter::new(pid)?;
         let inner = Arc::new(Mutex::new(wrapped_child));
         let inner_wait = inner.clone();
 
-        spawn_wait_thread(move || wait_on_child(&inner_wait, pid), tx, guard);
+        spawn_wait_thread(move || wait_on_child(&inner_wait, waiter), tx, guard);
 
         Ok((
             rx,
@@ -533,9 +547,9 @@ fn spawn_pipe_reader<F: Fn(Vec<u8>) -> CommandEvent + Send + Copy + 'static>(
 /// the first `try_wait` succeeds immediately; the loop is a defensive fallback.
 fn wait_on_child(
     inner: &Arc<Mutex<Box<dyn process_wrap::std::StdChildWrapper>>>,
-    pid: u32,
+    waiter: ExitWaiter,
 ) -> std::io::Result<std::process::ExitStatus> {
-    wait_for_exit_without_reaping(pid)?;
+    waiter.wait()?;
     loop {
         if let Some(status) = inner.lock().unwrap().try_wait()? {
             return Ok(status);
@@ -544,57 +558,91 @@ fn wait_on_child(
     }
 }
 
-/// Blocks until `pid` has exited, leaving it in a waitable state so that the
-/// owning wrapper can still collect the exit status.
+/// Blocks until the child exits, leaving it in a waitable (unreaped) state so
+/// that the owning wrapper can still collect the exit status.
+///
+/// On Windows the process handle is opened at construction time, while the
+/// caller is guaranteed to still own the child, so waiting can never resolve
+/// a recycled pid to an unrelated process.
+struct ExitWaiter {
+    #[cfg(unix)]
+    pid: u32,
+    #[cfg(windows)]
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY (windows): the handle is an owned kernel handle; sending it across
+// threads is safe, and it is only closed once, in Drop.
+#[cfg(windows)]
+unsafe impl Send for ExitWaiter {}
+
+#[cfg(windows)]
+impl Drop for ExitWaiter {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        unsafe { CloseHandle(self.handle) }.ok();
+    }
+}
+
 #[cfg(unix)]
-fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    loop {
-        // SAFETY: `info` is a valid, writable `siginfo_t`. `WNOWAIT` leaves the
-        // child reapable, so this never steals the status from `try_wait`.
-        let ret = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        // ECHILD: a concurrent `kill()` reaped the child first; the wrapper
-        // holds the cached exit status, so let `try_wait` return it.
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(());
-        }
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
+impl ExitWaiter {
+    fn new(pid: u32) -> std::io::Result<Self> {
+        Ok(Self { pid })
+    }
+
+    fn wait(&self) -> std::io::Result<()> {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        loop {
+            // SAFETY: `info` is a valid, writable `siginfo_t`. `WNOWAIT`
+            // leaves the child reapable, so this never steals the status
+            // from `try_wait`.
+            let ret = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if ret == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            // ECHILD: the child was already reaped by another wait; the
+            // wrapper holds the cached exit status, so let `try_wait`
+            // return it.
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
     }
 }
 
-/// Blocks until `pid` has exited. The child is still owned (and unreaped) by
-/// the caller, so the process object — and therefore the PID — stays valid.
 #[cfg(windows)]
-fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
-    use windows::Win32::{
-        Foundation::{CloseHandle, WAIT_OBJECT_0},
-        System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE},
-    };
+impl ExitWaiter {
+    fn new(pid: u32) -> std::io::Result<Self> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+        // SAFETY: `pid` refers to a process the caller still owns a handle
+        // to, so it is live and cannot have been recycled.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(Self { handle })
+    }
 
-    // SAFETY: `pid` refers to a live handle-owned process, and the returned
-    // handle is closed exactly once below.
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
-    unsafe { CloseHandle(handle) }.ok();
-
-    if result == WAIT_OBJECT_0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    fn wait(&self) -> std::io::Result<()> {
+        use windows::Win32::{
+            Foundation::WAIT_OBJECT_0,
+            System::Threading::{WaitForSingleObject, INFINITE},
+        };
+        let result = unsafe { WaitForSingleObject(self.handle, INFINITE) };
+        if result == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
@@ -936,5 +984,154 @@ mod tests {
             ret, 0,
             "grandchild should be killed when process_group is on"
         );
+    }
+
+    /// Race the wait thread against kill() repeatedly: every cycle must end
+    /// in a Terminated event — an Error event means one side lost the reap
+    /// race unhandled. Slow-ish, so ignored by default; run explicitly with
+    /// `cargo test -- --ignored stress_spawn_kill`.
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore]
+    fn stress_spawn_kill() {
+        for i in 0..300 {
+            let cmd = Command::new("sleep")
+                .args(["5"])
+                .set_process_group(i % 2 == 0);
+            let (mut rx, child) = cmd.spawn().unwrap();
+            child.kill().unwrap();
+            let got = tauri::async_runtime::block_on(async move {
+                while let Some(ev) = rx.recv().await {
+                    match ev {
+                        CommandEvent::Terminated(_) => return true,
+                        CommandEvent::Error(e) => panic!("cycle {i}: error event: {e}"),
+                        _ => {}
+                    }
+                }
+                false
+            });
+            assert!(got, "cycle {i}: channel closed without Terminated event");
+        }
+    }
+
+    /// Windows kill regression tests.
+    ///
+    /// These drive the real `spawn()`/`kill()` (os_pipe plumbing, reader
+    /// guard, bounded event channel, tauri async runtime). Each test prints
+    /// stage markers and arms a watchdog so a hang identifies its stage in
+    /// CI logs instead of timing out silently.
+    #[cfg(windows)]
+    mod win_diag {
+        use super::super::*;
+        use std::time::Duration;
+
+        fn watchdog(name: &'static str) {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                println!("WATCHDOG: {name} HUNG");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                std::process::exit(101);
+            });
+        }
+
+        fn mark(name: &str, stage: &str) {
+            println!("[{name}] {stage}");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+
+        /// Drain events until Terminated or timeout; panics on timeout.
+        fn expect_terminated(name: &'static str, mut rx: Receiver<CommandEvent>) {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    while let Some(event) = rx.recv().await {
+                        if let CommandEvent::Terminated(payload) = event {
+                            let _ = done_tx.send(payload);
+                            return;
+                        }
+                    }
+                });
+            });
+            match done_rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(payload) => mark(name, &format!("terminated: {payload:?}")),
+                Err(e) => panic!("[{name}] no Terminated event within 20s: {e}"),
+            }
+        }
+
+        fn long_running() -> Command {
+            Command::new("ping").args(["-n", "90", "127.0.0.1"])
+        }
+
+        fn tree_running() -> Command {
+            Command::new("cmd").args([
+                "/C",
+                "start /B ping -n 90 127.0.0.1 > NUL & ping -n 90 127.0.0.1 > NUL",
+            ])
+        }
+
+        fn kill_scenario(name: &'static str, cmd: Command, expect_event: bool) {
+            watchdog(name);
+            mark(name, "spawning");
+            let (rx, child) = cmd.spawn().unwrap();
+            mark(name, &format!("spawned pid {}", child.pid()));
+            std::thread::sleep(Duration::from_millis(500));
+            mark(name, "killing");
+            child.kill().unwrap();
+            mark(name, "killed");
+            if expect_event {
+                expect_terminated(name, rx);
+            }
+        }
+
+        #[test]
+        fn diag_kill_plain_live() {
+            kill_scenario("plain-live", long_running(), true);
+        }
+
+        #[test]
+        fn diag_kill_job_live() {
+            kill_scenario("job-live", long_running().set_process_group(true), true);
+        }
+
+        #[test]
+        fn diag_kill_job_tree() {
+            kill_scenario("job-tree", tree_running().set_process_group(true), true);
+        }
+
+        /// Without a process group the `start /B` grandchild survives the
+        /// kill and keeps the stdio pipes open, so Terminated is expected to
+        /// lag — only assert that kill() itself returns.
+        #[test]
+        fn diag_kill_plain_tree_kill_returns() {
+            kill_scenario("plain-tree", tree_running(), false);
+        }
+
+        #[test]
+        fn diag_kill_job_after_exit() {
+            watchdog("job-after-exit");
+            let cmd = Command::new("cmd")
+                .args(["/C", "echo done"])
+                .set_process_group(true);
+            mark("job-after-exit", "spawning");
+            let (rx, child) = cmd.spawn().unwrap();
+            mark("job-after-exit", &format!("spawned pid {}", child.pid()));
+            std::thread::sleep(Duration::from_secs(2));
+            mark("job-after-exit", "killing exited child");
+            // Child exited long ago; kill() must not hang on the stale job.
+            let _ = child.kill();
+            mark("job-after-exit", "killed");
+            expect_terminated("job-after-exit", rx);
+        }
+
+        #[test]
+        fn diag_output_echo() {
+            watchdog("output-echo");
+            let output = tauri::async_runtime::block_on(
+                Command::new("cmd").args(["/C", "echo hello"]).output(),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
+        }
     }
 }
