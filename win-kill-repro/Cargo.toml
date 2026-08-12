@@ -1,0 +1,22 @@
+# Standalone diagnostic crate for the Windows kill() hang reported on
+# tauri-apps/plugins-workspace#3351. Not part of the workspace.
+[package]
+name = "win-kill-repro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+process-wrap = { version = "8.2", default-features = false, features = [
+  "std",
+  "process-group",
+  "creation-flags",
+  "job-object",
+  "tracing",
+] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_Threading"] }

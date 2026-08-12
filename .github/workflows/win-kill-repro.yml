@@ -1,0 +1,24 @@
+name: win-kill-repro
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/windows-kill-repro
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        working-directory: win-kill-repro
+        run: cargo build --release
+
+      - name: Run scenario matrix
+        working-directory: win-kill-repro
+        env:
+          RUST_LOG: process_wrap=trace
+        run: cargo run --release
